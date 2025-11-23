@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+requests
+langchain==0.2.16
+langchain-openai
+pydantic
+pypdf
+python-multipart
