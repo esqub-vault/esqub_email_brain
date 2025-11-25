@@ -1,6 +1,7 @@
 import os
+import json
 from io import BytesIO
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 import requests
 from fastapi import FastAPI, HTTPException, Depends, Security
@@ -10,9 +11,7 @@ from pypdf import PdfReader
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.prompts import PromptTemplate
-from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from langchain_openai import ChatOpenAI
-
 
 # -----------------------------------------------------------
 # FastAPI app
@@ -23,7 +22,6 @@ app = FastAPI(
     description="LLM microservice to summarise documents and extract key dates.",
     swagger_ui_parameters={"persistAuthorization": True},  # keep auth between calls
 )
-
 
 # -----------------------------------------------------------
 # API key security
@@ -56,7 +54,6 @@ async def check_api_key(api_key: str = Security(api_key_header)):
 
     return api_key
 
-
 # -----------------------------------------------------------
 # Request / response models
 # -----------------------------------------------------------
@@ -70,7 +67,6 @@ class TokenUsage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
-
 
 # -----------------------------------------------------------
 # Utility functions
@@ -111,7 +107,7 @@ def extract_text_generic(data: bytes, mime_type: Optional[str] = None) -> str:
         return data.decode("latin-1", errors="ignore")
 
 
-def build_llm():
+def build_llm() -> ChatOpenAI:
     """
     Create the ChatOpenAI LLM instance.
     Uses OPENAI_API_KEY from environment (set on Render).
@@ -121,9 +117,12 @@ def build_llm():
         temperature=0.2,
     )
 
+# -----------------------------------------------------------
+# LLM helper functions (with token usage)
+# -----------------------------------------------------------
 
-def summarise_document(text: str) -> str:
-    """Return a markdown summary of the document."""
+def summarise_document(text: str) -> Tuple[str, TokenUsage]:
+    """Return a markdown summary of the document + token usage."""
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1500,
         chunk_overlap=200,
@@ -139,13 +138,43 @@ def summarise_document(text: str) -> str:
     )
 
     llm = build_llm()
-    chain = prompt | llm | StrOutputParser()
-    summary = chain.invoke({"text": combined_text})
-    return summary
+    # Build the final prompt string
+    formatted_prompt = prompt.format(text=combined_text)
+
+    # Call the model directly so we can access usage_metadata
+    response = llm.invoke(formatted_prompt)
+
+    # Content
+    summary = getattr(response, "content", str(response))
+
+    # Usage metadata from LangChain ChatOpenAI
+    usage_meta = getattr(response, "usage_metadata", {}) or {}
+
+    prompt_tokens = (
+        usage_meta.get("prompt_tokens")
+        or usage_meta.get("input_tokens")
+        or 0
+    )
+    completion_tokens = (
+        usage_meta.get("completion_tokens")
+        or usage_meta.get("output_tokens")
+        or 0
+    )
+    total_tokens = usage_meta.get("total_tokens") or (
+        prompt_tokens + completion_tokens
+    )
+
+    usage = TokenUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+    )
+
+    return summary, usage
 
 
-def extract_key_dates(text: str) -> List[Dict[str, Any]]:
-    """Return a list of important dates as structured JSON."""
+def extract_key_dates(text: str) -> Tuple[List[Dict[str, Any]], TokenUsage]:
+    """Return a list of important dates as structured JSON + token usage."""
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1500,
         chunk_overlap=200,
@@ -153,37 +182,67 @@ def extract_key_dates(text: str) -> List[Dict[str, Any]]:
     chunks = splitter.split_text(text)
     combined_text = "\n\n".join(chunks)
 
-    parser = JsonOutputParser()
+    llm = build_llm()
 
-    prompt = PromptTemplate(
-        template=(
-            "You are an assistant extracting important dates from a document.\n"
-            "Return a JSON list where each item has:\n"
-            "- raw_text: the exact date text from the document\n"
-            "- date_iso: the date in YYYY-MM-DD format if you can infer it, else null\n"
-            "- label: a short label like 'Contract start', 'Contract end', 'Notice period', etc.\n"
-            "- context: one sentence describing what this date refers to.\n\n"
-            "Document:\n{doc}\n\n"
-            "{format_instructions}"
-        ),
-        input_variables=["doc"],
-        partial_variables={"format_instructions": parser.get_format_instructions()},
+    # Simple format instructions
+    format_instructions = (
+        "Return ONLY valid JSON. The top-level value must be a JSON array of objects "
+        "with keys: raw_text, date_iso, label, context."
     )
 
-    llm = build_llm()
-    chain = prompt | llm | parser
-    result = chain.invoke({"doc": combined_text})
-    return result
+    prompt_text = (
+        "You are an assistant extracting important dates from a document.\n"
+        "Return a JSON list where each item has:\n"
+        "- raw_text: the exact date text from the document\n"
+        "- date_iso: the date in YYYY-MM-DD format if you can infer it, else null\n"
+        "- label: a short label like 'Contract start', 'Contract end', 'Notice period', etc.\n"
+        "- context: one sentence describing what this date refers to.\n\n"
+        f"Document:\n{combined_text}\n\n"
+        f"{format_instructions}"
+    )
 
+    response = llm.invoke(prompt_text)
+
+    raw_content = getattr(response, "content", "")
+    try:
+        result = json.loads(raw_content)
+    except Exception:
+        result = []
+
+    if not isinstance(result, list):
+        result = []
+
+    usage_meta = getattr(response, "usage_metadata", {}) or {}
+
+    prompt_tokens = (
+        usage_meta.get("prompt_tokens")
+        or usage_meta.get("input_tokens")
+        or 0
+    )
+    completion_tokens = (
+        usage_meta.get("completion_tokens")
+        or usage_meta.get("output_tokens")
+        or 0
+    )
+    total_tokens = usage_meta.get("total_tokens") or (
+        prompt_tokens + completion_tokens
+    )
+
+    usage = TokenUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+    )
+
+    return result, usage
 
 # -----------------------------------------------------------
-# Simple health endpoint (optional)
+# Simple health endpoint
 # -----------------------------------------------------------
 
 @app.get("/")
 def health():
     return {"status": "ok", "message": "Esqub Email Brain is running"}
-
 
 # -----------------------------------------------------------
 # Main processing endpoint (protected by API key)
@@ -217,14 +276,27 @@ def process_document(
     summary: Optional[str] = None
     key_dates: Optional[List[Dict[str, Any]]] = None
 
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_total_tokens = 0
+
     if req.request_type in ("summary", "summary_and_dates"):
-        summary = summarise_document(text)
+        summary, summary_usage = summarise_document(text)
+        total_prompt_tokens += summary_usage.prompt_tokens
+        total_completion_tokens += summary_usage.completion_tokens
+        total_total_tokens += summary_usage.total_tokens
 
     if req.request_type in ("key_dates", "summary_and_dates"):
-        key_dates = extract_key_dates(text)
+        key_dates, dates_usage = extract_key_dates(text)
+        total_prompt_tokens += dates_usage.prompt_tokens
+        total_completion_tokens += dates_usage.completion_tokens
+        total_total_tokens += dates_usage.total_tokens
 
-    # For now, token usage is not pulled from OpenAI; set zeros.
-    usage = TokenUsage(prompt_tokens=0, completion_tokens=0, total_tokens=0)
+    usage = TokenUsage(
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        total_tokens=total_total_tokens,
+    )
 
     return {
         "summary_markdown": summary,
