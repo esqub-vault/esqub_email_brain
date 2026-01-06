@@ -3,6 +3,8 @@ uvicorn[standard]
 requests
 langchain==0.2.16
 langchain-openai
+langchain-core
 pydantic
 pypdf
 python-multipart
+openai==1.58.1
